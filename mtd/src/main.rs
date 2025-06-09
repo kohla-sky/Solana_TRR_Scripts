@@ -3,8 +3,6 @@ use std::env;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use syn::{visit::Visit, Macro, File, Item, parse_file};
-use quote::ToTokens;
 
 struct TraitInfo {
     name: String,
@@ -178,91 +176,6 @@ struct AnalysisSummary {
     impl_count: usize,
 }
 
-struct MacroVisitor {
-    max_depth: usize,
-    current_depth: usize,
-    macro_depths: HashMap<String, usize>,
-}
-
-impl MacroVisitor {
-    fn new() -> Self {
-        MacroVisitor {
-            max_depth: 0,
-            current_depth: 0,
-            macro_depths: HashMap::new(),
-        }
-    }
-
-    fn analyze_macro_tokens(&mut self, tokens: proc_macro2::TokenStream) {
-        // Try parsing tokens as a complete file
-        if let Ok(file) = syn::parse2::<File>(tokens.clone()) {
-            self.visit_file(&file);
-        }
-
-        // Also try parsing as individual macros
-        if let Ok(mac) = syn::parse2::<Macro>(tokens) {
-            self.visit_macro(&mac);
-        }
-    }
-}
-
-impl<'ast> Visit<'ast> for MacroVisitor {
-    fn visit_macro(&mut self, mac: &'ast Macro) {
-        self.current_depth += 1;
-        
-        // Update max depth if current depth is greater
-        self.max_depth = self.max_depth.max(self.current_depth);
-        
-        // Get macro name
-        let name = mac.path.segments.last()
-            .map(|seg| seg.ident.to_string())
-            .unwrap_or_else(|| "unknown".to_string());
-            
-        // Update depth for this specific macro
-        self.macro_depths.entry(name)
-            .and_modify(|d| *d = (*d).max(self.current_depth))
-            .or_insert(self.current_depth);
-
-        // Analyze the macro's token stream for nested macros
-        self.analyze_macro_tokens(mac.tokens.clone());
-        
-        self.current_depth -= 1;
-    }
-
-    fn visit_item(&mut self, item: &'ast Item) {
-        // Check for attribute macros
-        for attr in item.attrs() {
-            if attr.path().is_ident("derive") || 
-               attr.path().is_ident("proc_macro") ||
-               attr.path().is_ident("proc_macro_derive") {
-                self.current_depth += 1;
-                self.max_depth = self.max_depth.max(self.current_depth);
-                
-                // Parse and visit the attribute's tokens
-                if let Ok(tokens) = attr.parse_args::<proc_macro2::TokenStream>() {
-                    self.analyze_macro_tokens(tokens);
-                }
-                
-                self.current_depth -= 1;
-            }
-        }
-        
-        // Continue visiting the item's contents
-        syn::visit::visit_item(self, item);
-    }
-}
-
-fn analyze_file(path: &Path) -> io::Result<MacroVisitor> {
-    let content = fs::read_to_string(path)?;
-    let syntax = parse_file(&content).map_err(|e| {
-        io::Error::new(io::ErrorKind::InvalidData, format!("Parse error: {}", e))
-    })?;
-
-    let mut visitor = MacroVisitor::new();
-    visitor.visit_file(&syntax);
-    Ok(visitor)
-}
-
 fn visit_dirs(dir: &Path, cb: &mut dyn FnMut(&Path), recursive: bool) -> io::Result<()> {
     if dir.is_dir() {
         for entry in fs::read_dir(dir)? {
@@ -288,19 +201,8 @@ fn print_help() {
     println!("  -f, --files    Show maximum trait depth per file");
     println!("  -d, --dirs     Show maximum trait depth per directory (recursive)");
     println!("  -t, --target   Show analysis for target directory only (non-recursive)");
-    println!("  -o, --output   Output results to specified file");
     println!();
     println!("If TARGET_DIR is not specified, the current directory will be used.");
-}
-
-fn write_output(content: String, output_file: Option<&str>) -> io::Result<()> {
-    match output_file {
-        Some(path) => fs::write(path, content),
-        None => {
-            print!("{}", content);
-            Ok(())
-        }
-    }
 }
 
 fn main() -> io::Result<()> {
@@ -310,7 +212,6 @@ fn main() -> io::Result<()> {
     let mut show_per_dir = false;
     let mut target_only = false;
     let mut target_dir = None;
-    let mut output_file = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -319,28 +220,10 @@ fn main() -> io::Result<()> {
                 print_help();
                 return Ok(());
             }
-            "-v" | "--verbose" => {
-                verbose = true;
-            }
-            "-f" | "--files" => {
-                show_per_file = true;
-            }
-            "-d" | "--dirs" => {
-                show_per_dir = true;
-            }
-            "-t" | "--target" => {
-                target_only = true;
-            }
-            "-o" | "--output" => {
-                if i + 1 < args.len() {
-                    output_file = Some(args[i + 1].clone());
-                    i += 1;
-                } else {
-                    eprintln!("Error: Output file path not provided");
-                    print_help();
-                    return Ok(());
-                }
-            }
+            "-v" | "--verbose" => verbose = true,
+            "-f" | "--files" => show_per_file = true,
+            "-d" | "--dirs" => show_per_dir = true,
+            "-t" | "--target" => target_only = true,
             dir if !dir.starts_with('-') => {
                 target_dir = Some(PathBuf::from(dir));
             }
@@ -408,84 +291,70 @@ fn main() -> io::Result<()> {
         }
     }, !target_only)?;
 
-    // Create a String to store all output
-    let mut output_content = String::new();
-
-    output_content.push_str(&format!("Analyzing Rust files in directory: {}\n", target_dir.display()));
-    if target_only {
-        output_content.push_str("(Non-recursive analysis)\n");
-    }
-
     // Print file-level summaries if requested
     if show_per_file {
-        output_content.push_str("\nFile-Level Summary:\n");
-        output_content.push_str("==================\n");
+        println!("\nFile-Level Summary:");
+        println!("==================");
         for (path, summary) in &file_summaries {
-            output_content.push_str(&format!("\n{}\n", path.display()));
-            output_content.push_str(&format!("  Maximum Trait Depth: {}\n", summary.max_depth));
-            output_content.push_str(&format!("  Trait Count: {}\n", summary.trait_count));
-            output_content.push_str(&format!("  Implementation Count: {}\n", summary.impl_count));
+            println!("\n{}", path.display());
+            println!("  Maximum Trait Depth: {}", summary.max_depth);
+            println!("  Trait Count: {}", summary.trait_count);
+            println!("  Implementation Count: {}", summary.impl_count);
         }
     }
 
     // Print directory-level summaries if requested
     if show_per_dir {
-        output_content.push_str("\nDirectory-Level Summary (Recursive):\n");
-        output_content.push_str("=================================\n");
+        println!("\nDirectory-Level Summary (Recursive):");
+        println!("=================================");
         for (dir_path, analyzer) in &dir_summaries {
             let summary = analyzer.get_summary();
-            output_content.push_str(&format!("\n{}\n", dir_path.display()));
-            output_content.push_str(&format!("  Maximum Trait Depth: {}\n", summary.max_depth));
-            output_content.push_str(&format!("  Trait Count: {}\n", summary.trait_count));
-            output_content.push_str(&format!("  Implementation Count: {}\n", summary.impl_count));
+            println!("\n{}", dir_path.display());
+            println!("  Maximum Trait Depth: {}", summary.max_depth);
+            println!("  Trait Count: {}", summary.trait_count);
+            println!("  Implementation Count: {}", summary.impl_count);
         }
     }
 
     // Print target directory summary if requested
     if target_only {
-        output_content.push_str("\nTarget Directory Summary:\n");
-        output_content.push_str("=======================\n");
+        println!("\nTarget Directory Summary:");
+        println!("=======================");
         if let Some(analyzer) = dir_summaries.get(&target_dir) {
             let summary = analyzer.get_summary();
-            output_content.push_str(&format!("  Maximum Trait Depth: {}\n", summary.max_depth));
-            output_content.push_str(&format!("  Trait Count: {}\n", summary.trait_count));
-            output_content.push_str(&format!("  Implementation Count: {}\n", summary.impl_count));
+            println!("  Maximum Trait Depth: {}", summary.max_depth);
+            println!("  Trait Count: {}", summary.trait_count);
+            println!("  Implementation Count: {}", summary.impl_count);
         } else {
-            output_content.push_str("No Rust files found in target directory\n");
+            println!("No Rust files found in target directory");
         }
     }
 
-    // Add global summary section
+    // Print global summary
     let global_summary = trait_analyzer.get_summary();
-    output_content.push_str("\nGlobal Summary:\n");
-    output_content.push_str("==============\n");
-    output_content.push_str(&format!("Overall Maximum Trait Depth: {}\n", global_summary.max_depth));
-    output_content.push_str(&format!("Total Trait Count: {}\n", global_summary.trait_count));
-    output_content.push_str(&format!("Total Implementation Count: {}\n", global_summary.impl_count));
+    println!("\nGlobal Summary:");
+    println!("==============");
+    println!("Overall Maximum Trait Depth: {}", global_summary.max_depth);
+    println!("Total Trait Count: {}", global_summary.trait_count);
+    println!("Total Implementation Count: {}", global_summary.impl_count);
 
-    // Print final detailed analysis if no specific summary was requested
+    // Print trait hierarchy if no specific summary was requested
     if !show_per_file && !show_per_dir && !target_only {
-        output_content.push_str("\nFinal Analysis Report:\n");
-        output_content.push_str("====================\n");
-        
-        output_content.push_str("\nTrait Hierarchy:\n");
+        println!("\nTrait Hierarchy:");
         for (trait_name, supertraits) in &trait_analyzer.trait_graph {
-            output_content.push_str(&format!("{} -> {:?}\n", trait_name, supertraits));
+            println!("{} -> {:?}", trait_name, supertraits);
         }
 
-        output_content.push_str("\nType Implementations and Maximum Trait Depth:\n");
+        println!("\nType Implementations and Maximum Trait Depth:");
         for (type_name, traits) in &trait_analyzer.impl_map {
-            output_content.push_str(&format!("\n{} implements:\n", type_name));
+            println!("\n{} implements:", type_name);
             for trait_name in traits {
-                output_content.push_str(&format!("  - {}\n", trait_name));
+                println!("  - {}", trait_name);
             }
             let depth = trait_analyzer.calculate_max_depth(type_name);
-            output_content.push_str(&format!("Maximum trait depth: {}\n", depth));
+            println!("Maximum trait depth: {}", depth);
         }
     }
-
-    // Write output to file or stdout
-    write_output(output_content, output_file.as_deref())?;
 
     Ok(())
 } 
