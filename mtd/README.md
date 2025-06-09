@@ -1,13 +1,3 @@
-# Solana Code Analysis Tools
-
-This repository contains two analysis tools for Rust codebases:
-1. Maximum Struct Composition Depth (MSCD) Analyzer
-2. Maximum Trait Depth (MTD) Analyzer
-
-## MSCD Analyzer
-
-[Previous MSCD content remains...]
-
 ## MTD (Maximum Trait Depth) Analyzer
 
 The MTD analyzer examines trait hierarchies and implementations in Rust code. It helps identify complex trait relationships and calculates the maximum depth of trait inheritance chains in your codebase.
