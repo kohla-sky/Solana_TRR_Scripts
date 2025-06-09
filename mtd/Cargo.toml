@@ -1,0 +1,7 @@
+[package]
+name = "mtd"
+version = "0.1.0"
+edition = "2021"
+description = "A tool for analyzing trait hierarchies and implementations in Rust code"
+
+[dependencies] 
