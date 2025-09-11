@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::fs;
 use std::process::Command;
-use syn::{parse_file, Item, Fields, Type, GenericArgument, PathArguments};
+use syn::{parse_file, Item, Fields, Type, GenericArgument, PathArguments, UseTree, ItemUse, ItemMod};
 use quote::quote;
 use tempfile::TempDir;
 use url::Url;
@@ -23,12 +23,28 @@ struct TypeAlias {
     module_path: Vec<String>,
 }
 
+/// Represents an import/use statement
+#[derive(Debug, Clone)]
+struct ImportInfo {
+    /// The imported path (e.g., "a::b::Inner")
+    full_path: String,
+    /// The local name it's imported as (e.g., "Inner" or "Alias")
+    local_name: String,
+    /// The module where this import exists
+    module_path: Vec<String>,
+}
+
 /// Context for parsing with module information
 #[derive(Debug)]
 struct ParseContext {
     current_module_path: Vec<String>,
     structs: Vec<StructInfo>,
     type_aliases: Vec<TypeAlias>,
+    imports: Vec<ImportInfo>,
+    /// Maps module names to their file paths for out-of-line modules
+    module_files: HashMap<String, PathBuf>,
+    /// Root directory for resolving relative paths
+    root_dir: PathBuf,
 }
 
 impl ParseContext {
@@ -37,6 +53,20 @@ impl ParseContext {
             current_module_path: Vec::new(),
             structs: Vec::new(),
             type_aliases: Vec::new(),
+            imports: Vec::new(),
+            module_files: HashMap::new(),
+            root_dir: PathBuf::new(),
+        }
+    }
+
+    fn with_root_dir(root_dir: PathBuf) -> Self {
+        Self {
+            current_module_path: Vec::new(),
+            structs: Vec::new(),
+            type_aliases: Vec::new(),
+            imports: Vec::new(),
+            module_files: HashMap::new(),
+            root_dir,
         }
     }
 
@@ -47,6 +77,9 @@ impl ParseContext {
             current_module_path: new_path,
             structs: self.structs.clone(),
             type_aliases: self.type_aliases.clone(),
+            imports: self.imports.clone(),
+            module_files: self.module_files.clone(),
+            root_dir: self.root_dir.clone(),
         }
     }
 }
@@ -86,31 +119,35 @@ fn calculate_max_struct_depth(
 }
 
 /// Extracts all type dependencies from a syn::Type, handling wrappers and complex types
-fn extract_type_dependencies(ty: &Type) -> Vec<String> {
+fn extract_type_dependencies(ty: &Type, context: &ParseContext) -> Vec<String> {
     let mut dependencies = Vec::new();
     
     match ty {
         // Handle path types (most common case)
         Type::Path(type_path) => {
-            dependencies.extend(extract_path_dependencies(&type_path.path));
+            dependencies.extend(extract_path_dependencies(&type_path.path, context));
         }
         // Handle references (&T)
         Type::Reference(type_ref) => {
-            dependencies.extend(extract_type_dependencies(&type_ref.elem));
+            dependencies.extend(extract_type_dependencies(&type_ref.elem, context));
         }
         // Handle slices ([T])
         Type::Slice(type_slice) => {
-            dependencies.extend(extract_type_dependencies(&type_slice.elem));
+            dependencies.extend(extract_type_dependencies(&type_slice.elem, context));
         }
         // Handle arrays ([T; N])
         Type::Array(type_array) => {
-            dependencies.extend(extract_type_dependencies(&type_array.elem));
+            dependencies.extend(extract_type_dependencies(&type_array.elem, context));
         }
-        // Handle tuples
+        // Handle tuples - include ALL elements
         Type::Tuple(type_tuple) => {
             for elem in &type_tuple.elems {
-                dependencies.extend(extract_type_dependencies(elem));
+                dependencies.extend(extract_type_dependencies(elem, context));
             }
+        }
+        // Handle raw pointers (*const T, *mut T)
+        Type::Ptr(type_ptr) => {
+            dependencies.extend(extract_type_dependencies(&type_ptr.elem, context));
         }
         // Handle function pointers and other types
         _ => {
@@ -127,18 +164,27 @@ fn extract_type_dependencies(ty: &Type) -> Vec<String> {
 }
 
 /// Extract dependencies from a syn::Path, handling generics and module paths
-fn extract_path_dependencies(path: &syn::Path) -> Vec<String> {
+fn extract_path_dependencies(path: &syn::Path, context: &ParseContext) -> Vec<String> {
     let mut dependencies = Vec::new();
     
     // Get the full path as a string
-    let full_path = path.segments.iter()
+    let path_str = path.segments.iter()
         .map(|segment| segment.ident.to_string())
         .collect::<Vec<_>>()
         .join("::");
     
+    // Handle Self keyword
+    let resolved_path = if path_str == "Self" {
+        // Replace Self with current struct name (we'll handle this in the calling context)
+        path_str
+    } else {
+        // Resolve the path through imports and relative paths
+        resolve_path(&path_str, context)
+    };
+    
     // Add the main type if it's not primitive
-    if !is_primitive_type(&full_path) {
-        dependencies.push(full_path);
+    if !is_primitive_type(&resolved_path) {
+        dependencies.push(resolved_path);
     }
     
     // Extract generic arguments
@@ -146,13 +192,67 @@ fn extract_path_dependencies(path: &syn::Path) -> Vec<String> {
         if let PathArguments::AngleBracketed(args) = &segment.arguments {
             for arg in &args.args {
                 if let GenericArgument::Type(ty) = arg {
-                    dependencies.extend(extract_type_dependencies(ty));
+                    dependencies.extend(extract_type_dependencies(ty, context));
                 }
             }
         }
     }
     
     dependencies
+}
+
+/// Resolve a path string through imports, aliases, and relative paths
+fn resolve_path(path_str: &str, context: &ParseContext) -> String {
+    // Handle relative paths
+    let normalized_path = normalize_relative_path(path_str, &context.current_module_path);
+    
+    // Check if it's an import alias
+    if let Some(import) = context.imports.iter().find(|imp| imp.local_name == normalized_path) {
+        return import.full_path.clone();
+    }
+    
+    // Check if it's a simple unqualified name that might be imported
+    if !normalized_path.contains("::") {
+        // Look for imports that end with this name
+        if let Some(import) = context.imports.iter().find(|imp| {
+            imp.full_path.split("::").last() == Some(&normalized_path)
+        }) {
+            return import.full_path.clone();
+        }
+    }
+    
+    normalized_path
+}
+
+/// Normalize relative paths (crate::, self::, super::)
+fn normalize_relative_path(path_str: &str, current_module: &[String]) -> String {
+    if path_str.starts_with("crate::") {
+        // crate:: means from the root
+        path_str.strip_prefix("crate::").unwrap().to_string()
+    } else if path_str.starts_with("self::") {
+        // self:: means current module
+        let relative = path_str.strip_prefix("self::").unwrap();
+        if current_module.is_empty() {
+            relative.to_string()
+        } else {
+            format!("{}::{}", current_module.join("::"), relative)
+        }
+    } else if path_str.starts_with("super::") {
+        // super:: means parent module
+        let relative = path_str.strip_prefix("super::").unwrap();
+        if current_module.len() <= 1 {
+            relative.to_string()
+        } else {
+            let parent_path = &current_module[..current_module.len() - 1];
+            format!("{}::{}", parent_path.join("::"), relative)
+        }
+    } else if current_module.is_empty() || path_str.contains("::") {
+        // Already absolute or we're at root
+        path_str.to_string()
+    } else {
+        // Relative to current module
+        format!("{}::{}", current_module.join("::"), path_str)
+    }
 }
 
 /// Check if a type is a primitive type
@@ -168,6 +268,27 @@ fn is_primitive_type(type_name: &str) -> bool {
 
 /// Process items within a module or file, handling nested structures
 fn process_items(items: &[Item], context: &mut ParseContext) {
+    // First pass: collect imports and module declarations
+    for item in items {
+        match item {
+            Item::Use(item_use) => {
+                process_use_item(item_use, context);
+            }
+            Item::Mod(item_mod) => {
+                if item_mod.content.is_none() {
+                    // Out-of-line module (mod x;)
+                    let module_name = item_mod.ident.to_string();
+                    let module_path = resolve_module_file(&module_name, context);
+                    if let Some(path) = module_path {
+                        context.module_files.insert(module_name, path);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    
+    // Second pass: process structs and other items
     for item in items {
         match item {
             Item::Struct(item_struct) => {
@@ -179,14 +300,30 @@ fn process_items(items: &[Item], context: &mut ParseContext) {
                     // Named fields
                     Fields::Named(fields) => {
                         for field in &fields.named {
-                            let deps = extract_type_dependencies(&field.ty);
+                            let mut deps = extract_type_dependencies(&field.ty, context);
+                            // Handle Self references
+                            deps = deps.into_iter().map(|dep| {
+                                if dep == "Self" {
+                                    struct_name.clone()
+                                } else {
+                                    dep
+                                }
+                            }).collect();
                             field_types.extend(deps);
                         }
                     }
                     // Tuple structs (unnamed fields)
                     Fields::Unnamed(fields) => {
                         for field in &fields.unnamed {
-                            let deps = extract_type_dependencies(&field.ty);
+                            let mut deps = extract_type_dependencies(&field.ty, context);
+                            // Handle Self references
+                            deps = deps.into_iter().map(|dep| {
+                                if dep == "Self" {
+                                    struct_name.clone()
+                                } else {
+                                    dep
+                                }
+                            }).collect();
                             field_types.extend(deps);
                         }
                     }
@@ -217,12 +354,27 @@ fn process_items(items: &[Item], context: &mut ParseContext) {
                     // Merge results back
                     context.structs.extend(nested_context.structs);
                     context.type_aliases.extend(nested_context.type_aliases);
+                    context.imports.extend(nested_context.imports);
+                } else {
+                    // Out-of-line module - process the file if we found it
+                    let module_name = item_mod.ident.to_string();
+                    if let Some(module_file) = context.module_files.get(&module_name).cloned() {
+                        if let Ok(nested_context) = process_file(&module_file) {
+                            let mut nested_context_with_module = nested_context;
+                            nested_context_with_module.current_module_path = 
+                                [context.current_module_path.clone(), vec![module_name]].concat();
+                            
+                            context.structs.extend(nested_context_with_module.structs);
+                            context.type_aliases.extend(nested_context_with_module.type_aliases);
+                            context.imports.extend(nested_context_with_module.imports);
+                        }
+                    }
                 }
             }
             Item::Type(item_type) => {
                 // Handle type aliases
                 let alias_name = item_type.ident.to_string();
-                let target_deps = extract_type_dependencies(&item_type.ty);
+                let target_deps = extract_type_dependencies(&item_type.ty, context);
                 
                 if let Some(target_type) = target_deps.first() {
                     let full_alias_name = if context.current_module_path.is_empty() {
@@ -243,6 +395,78 @@ fn process_items(items: &[Item], context: &mut ParseContext) {
     }
 }
 
+/// Process a use statement to extract import information
+fn process_use_item(item_use: &ItemUse, context: &mut ParseContext) {
+    process_use_tree(&item_use.tree, Vec::new(), context);
+}
+
+/// Recursively process use tree to extract all imports
+fn process_use_tree(tree: &UseTree, prefix: Vec<String>, context: &mut ParseContext) {
+    match tree {
+        UseTree::Path(use_path) => {
+            let mut new_prefix = prefix;
+            new_prefix.push(use_path.ident.to_string());
+            process_use_tree(&use_path.tree, new_prefix, context);
+        }
+        UseTree::Name(use_name) => {
+            let mut full_path = prefix;
+            full_path.push(use_name.ident.to_string());
+            let full_path_str = full_path.join("::");
+            let local_name = use_name.ident.to_string();
+            
+            context.imports.push(ImportInfo {
+                full_path: full_path_str,
+                local_name,
+                module_path: context.current_module_path.clone(),
+            });
+        }
+        UseTree::Rename(use_rename) => {
+            let mut full_path = prefix;
+            full_path.push(use_rename.ident.to_string());
+            let full_path_str = full_path.join("::");
+            let local_name = use_rename.rename.to_string();
+            
+            context.imports.push(ImportInfo {
+                full_path: full_path_str,
+                local_name,
+                module_path: context.current_module_path.clone(),
+            });
+        }
+        UseTree::Glob(_) => {
+            // For glob imports, we'd need more sophisticated handling
+            // For now, we'll skip them as they're complex to resolve
+        }
+        UseTree::Group(use_group) => {
+            for tree in &use_group.items {
+                process_use_tree(tree, prefix.clone(), context);
+            }
+        }
+    }
+}
+
+/// Resolve the file path for an out-of-line module
+fn resolve_module_file(module_name: &str, context: &ParseContext) -> Option<PathBuf> {
+    let base_path = if context.current_module_path.is_empty() {
+        context.root_dir.clone()
+    } else {
+        context.root_dir.join(context.current_module_path.join("/"))
+    };
+    
+    // Try module_name.rs first
+    let rs_path = base_path.join(format!("{}.rs", module_name));
+    if rs_path.exists() {
+        return Some(rs_path);
+    }
+    
+    // Try module_name/mod.rs
+    let mod_path = base_path.join(module_name).join("mod.rs");
+    if mod_path.exists() {
+        return Some(mod_path);
+    }
+    
+    None
+}
+
 /// Processes a single file and extracts struct information
 fn process_file(path: &Path) -> std::io::Result<ParseContext> {
     println!("Processing file: {:?}", path);
@@ -251,11 +475,12 @@ fn process_file(path: &Path) -> std::io::Result<ParseContext> {
     
     match parse_file(&content) {
         Ok(file) => {
-            let mut context = ParseContext::new();
+            let root_dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
+            let mut context = ParseContext::with_root_dir(root_dir);
             process_items(&file.items, &mut context);
             
-            println!("Found {} structs and {} type aliases in file", 
-                     context.structs.len(), context.type_aliases.len());
+            println!("Found {} structs, {} type aliases, and {} imports in file", 
+                     context.structs.len(), context.type_aliases.len(), context.imports.len());
             Ok(context)
         }
         Err(e) => {
@@ -267,7 +492,13 @@ fn process_file(path: &Path) -> std::io::Result<ParseContext> {
 
 /// Recursively process directories and files
 fn process_directory(path: &Path) -> std::io::Result<ParseContext> {
-    let mut combined_context = ParseContext::new();
+    let root_dir = if path.is_file() {
+        path.parent().unwrap_or(Path::new(".")).to_path_buf()
+    } else {
+        path.to_path_buf()
+    };
+    
+    let mut combined_context = ParseContext::with_root_dir(root_dir);
 
     if path.is_file() {
         if path.extension().and_then(|s| s.to_str()) == Some("rs") {
@@ -275,6 +506,7 @@ fn process_directory(path: &Path) -> std::io::Result<ParseContext> {
                 Ok(file_context) => {
                     combined_context.structs.extend(file_context.structs);
                     combined_context.type_aliases.extend(file_context.type_aliases);
+                    combined_context.imports.extend(file_context.imports);
                 }
                 Err(e) => eprintln!("Error processing file {:?}: {}", path, e),
             }
@@ -282,48 +514,86 @@ fn process_directory(path: &Path) -> std::io::Result<ParseContext> {
     } else if path.is_dir() {
         for entry in fs::read_dir(path)? {
             let entry = entry?;
-            let path = entry.path();
-            let sub_context = process_directory(&path)?;
+            let entry_path = entry.path();
+            let sub_context = process_directory(&entry_path)?;
             combined_context.structs.extend(sub_context.structs);
             combined_context.type_aliases.extend(sub_context.type_aliases);
+            combined_context.imports.extend(sub_context.imports);
         }
     }
 
     Ok(combined_context)
 }
 
-/// Resolve type aliases to their final types and normalize module paths
+/// Resolve type aliases to their final types, handling chains and multi-target aliases
 fn resolve_type_aliases(
     field_types: &[String], 
     type_aliases: &HashMap<String, String>,
     struct_names: &HashSet<String>,
     current_module_path: &[String]
 ) -> Vec<String> {
-    field_types.iter().map(|field_type| {
-        // First try to resolve through aliases
-        let mut resolved_type = field_type.clone();
-        let mut visited = HashSet::new();
+    field_types.iter().flat_map(|field_type| {
+        // Resolve alias chains
+        let mut resolved_types = resolve_alias_chain(field_type, type_aliases);
         
-        while let Some(target) = type_aliases.get(&resolved_type) {
-            if !visited.insert(resolved_type.clone()) {
+        // If no aliases were resolved, use the original type
+        if resolved_types.is_empty() {
+            resolved_types.push(field_type.clone());
+        }
+        
+        // For each resolved type, try to resolve relative module paths
+        resolved_types.into_iter().map(|resolved_type| {
+            if !resolved_type.contains("::") && !current_module_path.is_empty() {
+                let full_path = format!("{}::{}", current_module_path.join("::"), resolved_type);
+                if struct_names.contains(&full_path) {
+                    return full_path;
+                }
+            }
+            resolved_type
+        }).collect::<Vec<_>>()
+    }).collect()
+}
+
+/// Resolve a single type through alias chains, handling multi-target aliases
+fn resolve_alias_chain(type_name: &str, type_aliases: &HashMap<String, String>) -> Vec<String> {
+    let mut result = Vec::new();
+    let mut current = type_name.to_string();
+    let mut visited = HashSet::new();
+    
+    // Handle potential generic types like M<K, V>
+    if current.contains('<') {
+        // Extract the base type and generic arguments
+        if let Some(base_end) = current.find('<') {
+            let base_type = &current[..base_end];
+            let generics_part = &current[base_end..];
+            
+            // Try to resolve the base type
+            if let Some(target) = type_aliases.get(base_type) {
+                // If the target also has generics, we need to substitute
+                if target.contains('<') {
+                    result.push(current); // Keep original for now
+                } else {
+                    result.push(format!("{}{}", target, generics_part));
+                }
+            } else {
+                result.push(current);
+            }
+        } else {
+            result.push(current);
+        }
+    } else {
+        // Simple alias chain resolution
+        while let Some(target) = type_aliases.get(&current) {
+            if !visited.insert(current.clone()) {
                 // Circular alias, break
                 break;
             }
-            resolved_type = target.clone();
+            current = target.clone();
         }
-        
-        // Then try to resolve relative module paths to absolute paths
-        // If the type doesn't contain "::" and we have a current module context,
-        // try to find it in the current module first
-        if !resolved_type.contains("::") && !current_module_path.is_empty() {
-            let full_path = format!("{}::{}", current_module_path.join("::"), resolved_type);
-            if struct_names.contains(&full_path) {
-                return full_path;
-            }
-        }
-        
-        resolved_type
-    }).collect()
+        result.push(current);
+    }
+    
+    result
 }
 
 /// Main function to analyze struct composition depth
