@@ -1,2 +1,8 @@
+# Rust compiled artifacts
 target/
-cargo.lock
+*/target/
+**/target/
+
+# Cargo lock files
+Cargo.lock
+
