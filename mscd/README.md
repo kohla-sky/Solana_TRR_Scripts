@@ -1,81 +1,89 @@
-## MSCD Analyzer
+# MSCD Analyzer
 
-This tool analyzes Rust codebases to determine the maximum depth of struct compositions and provides detailed information about struct relationships.
+A Rust tool that analyzes codebases to find the maximum depth of struct compositions. Perfect for understanding how deeply nested your data structures are.
 
-## Features
+## What it does
 
-- Calculates maximum struct nesting depth
-- Lists all structs and their field types
-- Analyzes struct dependencies
-- Provides detailed struct composition information
-- Handles recursive struct definitions
+- Calculates how many levels deep structs are nested
+- Shows all struct dependencies 
+- Works with complex Rust patterns like generics, modules, and type aliases
+- Can analyze any Git repository directly from a URL
 
-## Installation & Build
+## Quick Start
 
-### Prerequisites
-- Rust and Cargo (latest stable version)
-- `syn` and `quote` crates (included in Cargo.toml)
-
-### Build Steps
-1. First, build the analyzer:
 ```bash
+# Build the tool
 cargo build
+
+# Analyze a local directory
+cargo run -- ./src
+
+# Analyze a GitHub repository
+cargo run -- --repo https://github.com/user/project.git src/
+
+# Get help
+cargo run -- --help
 ```
 
-2. Alternatively, you can build and run in release mode for better performance:
+## Real-world example
+
+We tested this on the [Drift Protocol v2](https://github.com/drift-labs/protocol-v2) (a complex Solana DeFi protocol):
+
 ```bash
-cargo build --release
+cargo run -- --repo https://github.com/drift-labs/protocol-v2.git programs/drift/src
 ```
 
-## Usage
+**Results**: 223 structs with maximum depth of 5 levels.
 
-### Basic Usage
+## Use
 
-To analyze a directory containing Rust files:
+This tool understands:
+
+- **Nested modules** - finds structs buried inside `mod a { mod b { struct Inner; } }`
+- **Tuple structs** - recognizes `struct Mid(Inner)` dependencies  
+- **Wrapper types** - sees through `Vec<T>`, `Option<T>`, `Box<T>`, references, arrays
+- **Module paths** - resolves `a::b::Inner` correctly
+- **Type aliases** - follows `type T = Inner` to the real type
+- **Git repositories** - clone and analyze any public repo
+
+## Usage examples
 
 ```bash
-cargo run <directory_path>
+# Local analysis
+cargo run -- ./my-rust-project/src
+cargo run -- /path/to/rust/files
+
+# Remote repository analysis  
+cargo run -- --repo https://github.com/solana-labs/solana.git programs/
+cargo run -- --repo git@github.com:user/private-repo.git src/lib/
+
+# Mix of both
+cargo run -- --repo /local/repo/path ./specific/module/
 ```
 
-For example:
-```bash
-cargo run ../sample-program/src    # Analyze a specific program
-cargo run ../                      # Analyze all programs in parent directory
-```
-
-### Command Line Options
-
-- No arguments or `-h` or `--help`: Shows help message
-- `<directory>`: Path to the directory containing Rust files to analyze
-
-### Output Information
-
-The analyzer provides:
-1. Maximum struct composition depth
-2. Total number of structs found
-3. Detailed listing of each struct and its field types
-4. Struct dependency relationships
-
-## Example Output
+## Sample output
 
 ```
 Analysis Results:
 =================
 Maximum struct composition depth: 4
-Struct count: 140
+
+Struct count: 45
 
 Structs with their field types:
 ============================
-[Detailed struct information follows...]
+
+User
+  - Pubkey
+  - UserStats
+
+ComplexStruct
+  - Vec<Option<Box<Inner>>>
+  - a::b::c::Nested
 ```
 
-## Error Handling
+## Requirements
 
-- If the specified directory doesn't exist, an error message will be displayed
-- Invalid Rust files are skipped with appropriate error messages
-- Circular dependencies are properly handled
+- Rust and Cargo
+- Git (for repository cloning)
 
-## Notes
-
-- The analyzer recursively processes all `.rs` files in the specified directory
-- Struct composition depth is calculated by following field type references
