@@ -30,37 +30,163 @@ impl FileAnalyzer {
     fn analyze_file(&mut self, path: &Path) -> io::Result<()> {
         let content = fs::read_to_string(path)?;
         
-        // Simple parsing for trait declarations
-        for line in content.lines() {
-            let line = line.trim();
-            
-            // Parse trait declarations
-            if line.starts_with("trait ") || line.starts_with("pub trait ") {
-                if let Some(trait_info) = self.parse_trait_declaration(line) {
-                    self.traits.push(trait_info);
-                }
-            }
-            
-            // Parse trait implementations
-            if line.starts_with("impl ") {
-                if let Some(impl_info) = self.parse_impl_declaration(line) {
-                    self.impls.push(impl_info);
-                }
-            }
-        }
+        // Parse the entire file content, handling multiline declarations
+        self.parse_content(&content);
         
         Ok(())
     }
 
+    fn parse_content(&mut self, content: &str) {
+        let mut chars = content.chars().peekable();
+        let mut current_line = String::new();
+        let mut in_multiline_declaration = false;
+        let mut brace_depth = 0;
+        let mut declaration_buffer = String::new();
+
+        while let Some(ch) = chars.next() {
+            match ch {
+                '\n' | '\r' => {
+                    if !in_multiline_declaration {
+                        self.process_line(&current_line.trim());
+                        current_line.clear();
+                    } else {
+                        declaration_buffer.push(' ');
+                    }
+                }
+                '{' => {
+                    current_line.push(ch);
+                    if in_multiline_declaration {
+                        declaration_buffer.push(ch);
+                        brace_depth += 1;
+                        if brace_depth == 1 {
+                            // End of declaration, process it
+                            self.process_line(&declaration_buffer.trim());
+                            declaration_buffer.clear();
+                            in_multiline_declaration = false;
+                            brace_depth = 0;
+                        }
+                    }
+                }
+                '}' => {
+                    current_line.push(ch);
+                    if in_multiline_declaration && brace_depth > 0 {
+                        declaration_buffer.push(ch);
+                        brace_depth -= 1;
+                    }
+                }
+                _ => {
+                    current_line.push(ch);
+                    if in_multiline_declaration {
+                        declaration_buffer.push(ch);
+                    }
+                }
+            }
+
+            // Check if we're starting a multiline declaration
+            if !in_multiline_declaration && (
+                self.is_trait_declaration_start(&current_line) || 
+                self.is_impl_declaration_start(&current_line)
+            ) {
+                // Check if the line ends without opening brace - might be multiline
+                let trimmed = current_line.trim();
+                if !trimmed.contains('{') && !trimmed.ends_with(';') {
+                    in_multiline_declaration = true;
+                    declaration_buffer = current_line.clone();
+                    current_line.clear();
+                }
+            }
+        }
+
+        // Process any remaining line
+        if !current_line.trim().is_empty() {
+            self.process_line(&current_line.trim());
+        }
+    }
+
+    fn is_trait_declaration_start(&self, line: &str) -> bool {
+        let trimmed = line.trim();
+        // Handle all visibility modifiers and unsafe
+        trimmed.starts_with("trait ") ||
+        trimmed.starts_with("pub trait ") ||
+        trimmed.starts_with("pub(crate) trait ") ||
+        trimmed.starts_with("pub(super) trait ") ||
+        trimmed.starts_with("pub(self) trait ") ||
+        trimmed.starts_with("pub(in ") && trimmed.contains(") trait ") ||
+        trimmed.starts_with("unsafe trait ") ||
+        trimmed.starts_with("pub unsafe trait ") ||
+        trimmed.starts_with("pub(crate) unsafe trait ") ||
+        trimmed.starts_with("pub(super) unsafe trait ")
+    }
+
+    fn is_impl_declaration_start(&self, line: &str) -> bool {
+        let trimmed = line.trim();
+        trimmed.starts_with("impl ") ||
+        trimmed.starts_with("unsafe impl ")
+    }
+
+    fn process_line(&mut self, line: &str) {
+        if self.is_trait_declaration_start(line) {
+            if let Some(trait_info) = self.parse_trait_declaration(line) {
+                self.traits.push(trait_info);
+            }
+        } else if self.is_impl_declaration_start(line) {
+            if let Some(impl_info) = self.parse_impl_declaration(line) {
+                self.impls.push(impl_info);
+            }
+        }
+    }
+
     fn parse_trait_declaration(&self, line: &str) -> Option<TraitInfo> {
-        let line = line.trim_start_matches("pub ").trim_start_matches("trait ");
-        let mut parts = line.split(':');
-        let name = parts.next()?.trim().to_string();
+        // Remove all visibility and safety modifiers
+        let mut cleaned = line.trim();
         
-        let supertraits = if let Some(supertrait_part) = parts.next() {
+        // Remove visibility modifiers
+        if cleaned.starts_with("pub(") {
+            if let Some(end_paren) = cleaned.find(')') {
+                cleaned = &cleaned[end_paren + 1..].trim();
+            }
+        } else if cleaned.starts_with("pub ") {
+            cleaned = &cleaned[4..];
+        }
+        
+        // Remove unsafe modifier
+        if cleaned.starts_with("unsafe ") {
+            cleaned = &cleaned[7..];
+        }
+        
+        // Remove trait keyword
+        if cleaned.starts_with("trait ") {
+            cleaned = &cleaned[6..];
+        } else {
+            return None;
+        }
+
+        // Find the trait name and supertraits
+        let colon_pos = cleaned.find(':');
+        let brace_pos = cleaned.find('{');
+        
+        let name_end = match (colon_pos, brace_pos) {
+            (Some(colon), Some(brace)) => colon.min(brace),
+            (Some(colon), None) => colon,
+            (None, Some(brace)) => brace,
+            (None, None) => cleaned.len(),
+        };
+
+        let name = cleaned[..name_end].trim().to_string();
+        if name.is_empty() {
+            return None;
+        }
+
+        let supertraits = if let Some(colon_pos) = colon_pos {
+            let supertrait_part = if let Some(brace_pos) = brace_pos {
+                &cleaned[colon_pos + 1..brace_pos]
+            } else {
+                &cleaned[colon_pos + 1..]
+            };
+            
             supertrait_part
                 .split('+')
-                .map(|s| s.trim().trim_end_matches('{').trim().to_string())
+                .map(|s| self.clean_identifier(s.trim()))
                 .filter(|s| !s.is_empty())
                 .collect()
         } else {
@@ -68,29 +194,52 @@ impl FileAnalyzer {
         };
 
         Some(TraitInfo {
-            name,
+            name: self.clean_identifier(&name),
             supertraits,
         })
     }
 
     fn parse_impl_declaration(&self, line: &str) -> Option<ImplInfo> {
-        let line = line.trim_start_matches("impl ");
+        let mut cleaned = line.trim();
         
+        // Remove unsafe modifier
+        if cleaned.starts_with("unsafe ") {
+            cleaned = &cleaned[7..];
+        }
+        
+        // Remove impl keyword
+        if cleaned.starts_with("impl ") {
+            cleaned = &cleaned[5..];
+        } else {
+            return None;
+        }
+
         // Handle cases like "impl Trait for Type"
-        if let Some(for_idx) = line.find(" for ") {
-            let trait_part = &line[..for_idx];
-            let type_part = &line[for_idx + 5..];
+        if let Some(for_idx) = cleaned.find(" for ") {
+            let trait_part = &cleaned[..for_idx];
+            let type_part = &cleaned[for_idx + 5..];
             
-            let trait_name = trait_part.trim().trim_end_matches('{').to_string();
-            let type_name = type_part.trim().trim_end_matches('{').to_string();
+            let trait_name = self.clean_identifier(trait_part.trim());
+            let type_name = self.clean_identifier(type_part.trim());
             
-            return Some(ImplInfo {
-                type_name,
-                trait_name,
-            });
+            if !trait_name.is_empty() && !type_name.is_empty() {
+                return Some(ImplInfo {
+                    type_name,
+                    trait_name,
+                });
+            }
         }
         
         None
+    }
+
+    fn clean_identifier(&self, identifier: &str) -> String {
+        identifier
+            .trim()
+            .trim_end_matches('{')
+            .trim_end_matches('}')
+            .trim()
+            .to_string()
     }
 }
 
