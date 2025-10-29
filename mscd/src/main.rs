@@ -70,18 +70,13 @@ impl ParseContext {
         }
     }
 
-    fn with_module(&self, module_name: String) -> Self {
-        let mut new_path = self.current_module_path.clone();
-        new_path.push(module_name);
-        Self {
-            current_module_path: new_path,
-            structs: self.structs.clone(),
-            type_aliases: self.type_aliases.clone(),
-            imports: self.imports.clone(),
-            module_files: self.module_files.clone(),
-            root_dir: self.root_dir.clone(),
-        }
+    fn push_module(&mut self, module_name: String) {
+        self.current_module_path.push(module_name);
     }
+    fn pop_module(&mut self) {
+        self.current_module_path.pop();
+    }
+
 }
 
 /// Calculates the maximum depth of nested struct compositions
@@ -346,27 +341,28 @@ fn process_items(items: &[Item], context: &mut ParseContext) {
             }
             Item::Mod(item_mod) => {
                 if let Some((_, items)) = &item_mod.content {
-                    // Process inline module
+                    /// Process inline module
                     let module_name = item_mod.ident.to_string();
-                    let mut nested_context = context.with_module(module_name);
-                    process_items(items, &mut nested_context);
-                    
-                    // Merge results back
-                    context.structs.extend(nested_context.structs);
-                    context.type_aliases.extend(nested_context.type_aliases);
-                    context.imports.extend(nested_context.imports);
-                } else {
-                    // Out-of-line module - process the file if we found it
+                    context.push_module(module_name);
+                    process_items(items, context);
+                    context.pop_module();
+                } else {       
+                    // Out-of-line module - process the file if we found it             
                     let module_name = item_mod.ident.to_string();
                     if let Some(module_file) = context.module_files.get(&module_name).cloned() {
-                        if let Ok(nested_context) = process_file(&module_file) {
-                            let mut nested_context_with_module = nested_context;
-                            nested_context_with_module.current_module_path = 
-                                [context.current_module_path.clone(), vec![module_name]].concat();
-                            
-                            context.structs.extend(nested_context_with_module.structs);
-                            context.type_aliases.extend(nested_context_with_module.type_aliases);
-                            context.imports.extend(nested_context_with_module.imports);
+                        if let Ok(mut nested) = process_file(&module_file) {
+                            for s in &mut nested.structs {
+                                s.module_path = [context.current_module_path.clone(), vec![module_name.clone()]].concat();
+                                s.name = if s.module_path.is_empty() {
+                                    s.name.clone()
+                                } else {
+                                    let base = s.name.split("::").last().unwrap_or(&s.name).to_string();
+                                    format!("{}::{}", s.module_path.join("::"), base)
+                                };
+                            }
+                            context.structs.append(&mut nested.structs);
+                            context.type_aliases.append(&mut nested.type_aliases);
+                            context.imports.append(&mut nested.imports);
                         }
                     }
                 }
@@ -503,10 +499,10 @@ fn process_directory(path: &Path) -> std::io::Result<ParseContext> {
     if path.is_file() {
         if path.extension().and_then(|s| s.to_str()) == Some("rs") {
             match process_file(path) {
-                Ok(file_context) => {
-                    combined_context.structs.extend(file_context.structs);
-                    combined_context.type_aliases.extend(file_context.type_aliases);
-                    combined_context.imports.extend(file_context.imports);
+                Ok(mut file_context) => {
+                    combined_context.structs.append(&mut file_context.structs);
+                    combined_context.type_aliases.append(&mut file_context.type_aliases);
+                    combined_context.imports.append(&mut file_context.imports);
                 }
                 Err(e) => eprintln!("Error processing file {:?}: {}", path, e),
             }
@@ -515,10 +511,12 @@ fn process_directory(path: &Path) -> std::io::Result<ParseContext> {
         for entry in fs::read_dir(path)? {
             let entry = entry?;
             let entry_path = entry.path();
-            let sub_context = process_directory(&entry_path)?;
-            combined_context.structs.extend(sub_context.structs);
-            combined_context.type_aliases.extend(sub_context.type_aliases);
-            combined_context.imports.extend(sub_context.imports);
+
+            let mut sub_context = process_directory(&entry_path)?;
+            combined_context.structs.append(&mut sub_context.structs);
+            combined_context.type_aliases.append(&mut sub_context.type_aliases);
+            combined_context.imports.append(&mut sub_context.imports);
+
         }
     }
 
