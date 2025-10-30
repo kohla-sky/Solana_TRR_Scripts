@@ -108,13 +108,22 @@ impl MacroDepthVisitor {
                     // Check for macro pattern: Ident + '!' + Group
                     if let Some(TokenTree::Punct(punct)) = iter.peek() {
                         if punct.as_char() == '!' {
-                            iter.next(); // consume '!'
                             
-                            // Check if this macro should be ignored (standard library/compiler helper)
+                            let mut lookahead = iter.clone();
+                            let _bang = lookahead.next(); 
+                            let next_after_bang = lookahead.next();
+
+                            let follows_group = matches!(next_after_bang, Some(TokenTree::Group(_)));
+                            if !follows_group {
+                                continue;
+                            }
+
+                            iter.next();                             
+
                             let is_ignored = self.ignored_macros.contains(&ident_str);
 
                             self.current_macro = Some(ident_str.clone());
-                            
+
                             // Only increment depth if NOT in the ignore list
                             if !is_ignored {
                                 self.current_depth += 1;
